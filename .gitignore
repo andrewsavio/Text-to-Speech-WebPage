@@ -23,3 +23,12 @@ npm-debug.log
 # Local integration
 debug_request.py
 debug_output.wav
+
+# Build artifacts
+build/
+Output/
+dist/
+*.exe
+*.zip
+*.pkg
+

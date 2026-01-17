@@ -46,12 +46,21 @@ app.add_middleware(
 
 # Serve Frontend
 # In production/docker, frontend build will be in "static" directory relative to main.py or /app/static
-STATIC_DIR = Path("/app/static")
-if not STATIC_DIR.exists():
-    STATIC_DIR = Path(__file__).parent / "static" # Local fallback
+# For Desktop (PyInstaller), we set STATIC_DIR env var or look in sys._MEIPASS/static
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+     # PyInstaller temp dir
+    STATIC_DIR = Path(sys._MEIPASS) / "static"
+elif "STATIC_DIR" in os.environ:
+    STATIC_DIR = Path(os.environ["STATIC_DIR"])
+else:
+    STATIC_DIR = Path("/app/static")
+    if not STATIC_DIR.exists():
+        STATIC_DIR = Path(__file__).parent / "static" # Local fallback
 
 if STATIC_DIR.exists():
     app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+else:
+    logger.warning(f"Static directory not found at: {STATIC_DIR}")
 
 @app.get("/")
 async def serve_index():
@@ -107,43 +116,51 @@ async def generate_audio(
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
     
-    model = get_model()
+    current_model = get_model()
     
-    # Determined voice state
+    # Determine which voice to use
     model_state = None
     
     if voice_file:
-        # User uploaded a custom voice sample
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            content = await voice_file.read()
-            tmp.write(content)
-            tmp.flush()
-            try:
-                logger.info(f"Processing custom voice file: {tmp.name}")
-                model_state = model.get_state_for_audio_prompt(Path(tmp.name), truncate=True)
-            except Exception as e:
-                logger.error(f"Error processing voice file: {e}")
-                raise HTTPException(status_code=500, detail="Failed to process voice file")
-            finally:
-                try:
-                    os.unlink(tmp.name)
-                except:
-                    pass
-    elif voice_url:
-        # Use one of the presets or a URL
+        # Load custom voice from upload
         try:
-            logger.info(f"Fetching voice from URL: {voice_url}")
-            model_state = model._cached_get_state_for_audio_prompt(voice_url, truncate=True)
+            # Save properly to temp file to ensure libsndfile can read it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                content = await voice_file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+            
+            model_state = current_model.get_state_for_audio_prompt(tmp_path, truncate=True)
+            os.unlink(tmp_path) # Cleanup
         except Exception as e:
-            logger.error(f"Error fetching voice URL: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch voice: {str(e)}")
+            logger.error(f"Error processing voice file: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process voice file: {str(e)}")
+
+    elif voice_url:
+        # Load preset voice
+        if voice_url in PREDEFINED_VOICES:
+             # It's a key
+             try:
+                 model_state = current_model._cached_get_state_for_audio_prompt(voice_url, truncate=True)
+             except Exception as e:
+                 logger.error(f"Error loading preset voice: {e}")
+                 raise HTTPException(status_code=500, detail=f"Failed to load preset voice: {str(e)}")
+        else:
+             # It's a URL
+            try:
+                logger.info(f"Fetching voice from URL: {voice_url}")
+                model_state = current_model.get_state_for_audio_prompt(voice_url, truncate=True)
+            except Exception as e:
+                logger.error(f"Error fetching voice URL: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to fetch voice: {str(e)}")
     else:
         # Default voice if none provided
         # Use 'alba' which is a predefined voice key that works without voice cloning weights
         try:
             default_voice = "alba"
-            model_state = model._cached_get_state_for_audio_prompt(default_voice, truncate=True)
+            model_state = current_model._cached_get_state_for_audio_prompt(default_voice, truncate=True)
         except Exception as e:
+             logger.error(f"Error loading default voice: {e}")
              raise HTTPException(status_code=500, detail=f"Failed to load default voice: {str(e)}")
 
     if model_state is None:
@@ -191,14 +208,24 @@ async def generate_audio(
                 self.q.put(None)
 
         try:
-            audio_chunks_gen = model.generate_audio_stream(
-                model_state=model_state, 
-                text_to_generate=text
+            # We must use the model instance to generate stream
+            gen = current_model.generate_audio_stream(
+                model_state=model_state,
+                text_to_generate=text,
+                frames_after_eos=None, # Auto
+                copy_state=True
             )
-            write_audio_chunks(FileLikeToQueue(queue), audio_chunks_gen, model.config.mimi.sample_rate)
+            
+            # Write to our queue wrapper
+            write_audio_chunks(
+                FileLikeToQueue(queue),
+                gen,
+                current_model.config.mimi.sample_rate
+            )
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            queue.put(None)
+        finally:
+            queue.put(None) # Signal end
 
     thread = threading.Thread(target=write_to_queue_wrapper)
     thread.start()

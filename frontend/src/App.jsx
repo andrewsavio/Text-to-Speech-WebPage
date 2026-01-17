@@ -55,7 +55,7 @@ function App() {
         responseType: 'blob', // Important for audio
       });
 
-      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const url = window.URL.createObjectURL(new Blob([response.data], { type: 'audio/wav' }));
       setAudioUrl(url);
     } catch (error) {
       console.error("Generation failed:", error);
@@ -76,6 +76,37 @@ function App() {
     const url = e.target.value;
     setVoiceUrl(url);
     setVoiceFile(null); // Clear file if preset selected
+  };
+
+  const handleDownload = async () => {
+    if (!audioUrl) return;
+
+    // Check if running in pywebview
+    if (window.pywebview && window.pywebview.api) {
+      try {
+        // Convert blob URL to blob
+        const blob = await fetch(audioUrl).then(r => r.blob());
+
+        // Convert blob to base64
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = async () => {
+          const base64data = reader.result;
+          await window.pywebview.api.save_audio(base64data);
+        };
+      } catch (e) {
+        console.error("Native save failed:", e);
+        alert("Failed to save file natively.");
+      }
+    } else {
+      // Fallback for web browser
+      const link = document.createElement('a');
+      link.href = audioUrl;
+      link.download = 'generated_speech.wav';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
   };
 
   return (
@@ -143,9 +174,29 @@ function App() {
 
         {audioUrl && (
           <div className="audio-result glass-card" style={{ padding: '20px', marginTop: '10px', background: 'rgba(0,0,0,0.2)' }}>
-            <audio controls src={audioUrl} autoPlay>
+            <audio controls src={audioUrl} autoPlay style={{ width: '100%', marginBottom: '10px' }} controlsList="nodownload">
               Your browser does not support the audio element.
             </audio>
+
+            <button
+              onClick={handleDownload}
+              className="generate-btn"
+              style={{
+                background: 'rgba(255, 255, 255, 0.1)',
+                marginTop: '10px',
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+                textDecoration: 'none',
+                fontSize: '0.9rem',
+                width: '100%',
+                cursor: 'pointer',
+                border: 'none',
+                color: 'white'
+              }}
+            >
+              <Download size={18} style={{ marginRight: '8px' }} /> Download Audio
+            </button>
           </div>
         )}
       </div>
